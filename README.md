@@ -87,6 +87,10 @@ mod-acore-portal-tools
 
 The portal uses `.portaltools` SOAP commands when those admin actions are enabled.
 
+## Related Projects
+
+- [`mod-acore-portal-tools`](https://github.com/gregdeichler/mod-acore-portal-tools) - optional AzerothCore module that adds portal helper commands and server-side raid/world-boss loot tracking.
+
 ## Public Assets
 
 The included art is generic replacement art. Server owners can replace files in `public/portal-art/` with their own realm-specific assets.
