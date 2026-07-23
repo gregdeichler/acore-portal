@@ -1,0 +1,13 @@
+services:
+  portal:
+    build: .
+    container_name: acore-portal
+    restart: unless-stopped
+    ports:
+      - "8088:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/downloads:ro
