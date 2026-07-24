@@ -21,6 +21,9 @@ const clientDownloadName = process.env.CLIENT_DOWNLOAD_NAME || "game-client.zip"
 const launcherDownloadPath = process.env.LAUNCHER_DOWNLOAD_PATH || "/downloads/launcher.zip";
 const launcherDownloadName = process.env.LAUNCHER_DOWNLOAD_NAME || "launcher.zip";
 const launcherTokenDays = Math.min(Math.max(Number(process.env.LAUNCHER_TOKEN_DAYS || 7), 1), 30);
+const csrfCookieName = "acore_portal_csrf";
+const csrfFieldName = "_csrf";
+const csrfSafeMethods = new Set(["GET", "HEAD", "OPTIONS"]);
 const trackedLootQualities = new Set([3, 4, 5]);
 const itemClassNames = {
   0: "Consumable",
@@ -59,6 +62,42 @@ app.use((req, res, next) => {
 app.use(express.static("public", { maxAge: "5m" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+
+app.use((req, res, next) => {
+  const isSafeMethod = csrfSafeMethods.has(req.method);
+  let token = readCsrfCookie(req);
+  if (isSafeMethod && !token) token = setCsrfCookie(req, res);
+  res.locals.csrfToken = token || "";
+
+  const send = res.send.bind(res);
+  res.send = (body) => {
+    if (typeof body === "string" && res.locals.csrfToken && body.includes("<form")) {
+      return send(injectCsrfInputs(body, res.locals.csrfToken));
+    }
+    return send(body);
+  };
+  next();
+});
+
+app.use((req, res, next) => {
+  if (csrfSafeMethods.has(req.method) || isCsrfExemptPath(req.path)) return next();
+
+  const cookieToken = readCsrfCookie(req);
+  const submittedToken = String(req.body?.[csrfFieldName] || req.get("x-csrf-token") || "");
+  if (csrfTokensMatch(cookieToken, submittedToken)) {
+    if (req.body && Object.prototype.hasOwnProperty.call(req.body, csrfFieldName)) delete req.body[csrfFieldName];
+    return next();
+  }
+
+  const user = currentUser(req);
+  return res.status(403).send(layout({
+    title: "Request Expired",
+    admin: Boolean(user?.isAdmin && req.path.startsWith("/admin")),
+    user,
+    body: `<section class="page-head"><h1>Request Expired</h1><a class="button ghost back-button" href="${user ? "/" : "/login"}"><span>Back</span></a></section>
+      <article class="panel error"><p>This form could not be verified. Go back, refresh the page, and try again.</p></article>`
+  }));
+});
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -140,6 +179,40 @@ function addCookie(res, cookie) {
   const existing = res.getHeader("Set-Cookie");
   if (!existing) return res.setHeader("Set-Cookie", cookie);
   return res.setHeader("Set-Cookie", Array.isArray(existing) ? [...existing, cookie] : [existing, cookie]);
+}
+
+function createCsrfToken() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function readCsrfCookie(req) {
+  const token = parseCookies(req)[csrfCookieName];
+  return /^[A-Za-z0-9_-]{32,128}$/.test(String(token || "")) ? token : "";
+}
+
+function setCsrfCookie(req, res) {
+  const token = createCsrfToken();
+  addCookie(res, `${csrfCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 8}${cookieSecurity(req)}`);
+  return token;
+}
+
+function csrfTokensMatch(cookieToken, submittedToken) {
+  if (!cookieToken || !submittedToken) return false;
+  const cookieBuffer = Buffer.from(String(cookieToken));
+  const submittedBuffer = Buffer.from(String(submittedToken));
+  return cookieBuffer.length === submittedBuffer.length && crypto.timingSafeEqual(cookieBuffer, submittedBuffer);
+}
+
+function isCsrfExemptPath(path) {
+  return String(path || "").startsWith("/api/launcher/");
+}
+
+function injectCsrfInputs(html, token) {
+  const escapedToken = escapeHtml(token);
+  return String(html).replace(
+    /(<form\b(?=[^>]*\bmethod\s*=\s*["']?post["']?)[^>]*>)/gi,
+    `$1<input type="hidden" name="${csrfFieldName}" value="${escapedToken}">`
+  );
 }
 
 function clearSession(req, res) {
