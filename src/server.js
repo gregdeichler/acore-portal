@@ -8,7 +8,10 @@ import { compactPortalKnowledge } from "./portal-knowledge.js";
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const realmName = process.env.REALM_NAME || "AzerothCore";
-const sessionSecret = process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD || "change-me-local-secret";
+const sessionSecret = process.env.SESSION_SECRET;
+if (!sessionSecret || sessionSecret.length < 32) {
+  throw new Error("SESSION_SECRET must be set to at least 32 characters.");
+}
 const registrationEnabled = String(process.env.REGISTRATION_ENABLED || "true").toLowerCase() === "true";
 const registrationAnswer = String(process.env.REGISTRATION_ANSWER || "example").toLowerCase();
 const registrationGateAttempts = new Map();
@@ -17,7 +20,7 @@ const clientDownloadPath = process.env.CLIENT_DOWNLOAD_PATH || "/downloads/game-
 const clientDownloadName = process.env.CLIENT_DOWNLOAD_NAME || "game-client.zip";
 const launcherDownloadPath = process.env.LAUNCHER_DOWNLOAD_PATH || "/downloads/launcher.zip";
 const launcherDownloadName = process.env.LAUNCHER_DOWNLOAD_NAME || "launcher.zip";
-const launcherTokenDays = Number(process.env.LAUNCHER_TOKEN_DAYS || 7);
+const launcherTokenDays = Math.min(Math.max(Number(process.env.LAUNCHER_TOKEN_DAYS || 7), 1), 30);
 const trackedLootQualities = new Set([3, 4, 5]);
 const itemClassNames = {
   0: "Consumable",
@@ -42,9 +45,12 @@ const db = mysql.createPool({
   user: process.env.DB_USER || "acore",
   password: process.env.DB_PASSWORD || "acore",
   waitForConnections: true,
-  connectionLimit: 6,
+  connectionLimit: Math.min(Math.max(Number(process.env.DB_POOL || 20), 4), 50),
+  queueLimit: Math.min(Math.max(Number(process.env.DB_QUEUE_LIMIT || 100), 10), 1000),
   namedPlaceholders: true
 });
+
+app.set("trust proxy", process.env.TRUST_PROXY || "loopback, linklocal, uniquelocal");
 
 app.use((req, res, next) => {
   res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet, noimageindex");
@@ -117,8 +123,17 @@ function currentUser(req) {
   }
 }
 
-function setSession(res, user) {
-  res.setHeader("Set-Cookie", `acore_portal_session=${encodeURIComponent(createSessionToken(user))}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}`);
+function isSecureRequest(req) {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  return Boolean(req.secure || forwardedProto === "https");
+}
+
+function cookieSecurity(req) {
+  return isSecureRequest(req) ? "; Secure" : "";
+}
+
+function setSession(req, res, user) {
+  res.setHeader("Set-Cookie", `acore_portal_session=${encodeURIComponent(createSessionToken(user))}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${cookieSecurity(req)}`);
 }
 
 function addCookie(res, cookie) {
@@ -127,25 +142,41 @@ function addCookie(res, cookie) {
   return res.setHeader("Set-Cookie", Array.isArray(existing) ? [...existing, cookie] : [existing, cookie]);
 }
 
-function clearSession(res) {
-  addCookie(res, "acore_portal_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+function clearSession(req, res) {
+  addCookie(res, `acore_portal_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${cookieSecurity(req)}`);
 }
 
 function requestIp(req) {
-  return String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+  return String(req.ip || req.socket.remoteAddress || "unknown").trim();
+}
+
+function pruneExpiringMap(map, now = Date.now(), maxEntries = 2000) {
+  for (const [key, value] of map.entries()) {
+    const expiresAt = Number(value?.expiresAt || value?.resetAt || 0);
+    if (expiresAt && expiresAt <= now) map.delete(key);
+  }
+  while (map.size > maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey === undefined) break;
+    map.delete(oldestKey);
+  }
 }
 
 function registrationGateStatus(req) {
   const cookieStatus = parseCookies(req).acore_portal_register_gate;
-  const ipStatus = registrationGateAttempts.get(requestIp(req));
+  pruneExpiringMap(registrationGateAttempts);
+  const ipEntry = registrationGateAttempts.get(requestIp(req));
+  const ipStatus = typeof ipEntry === "string" ? ipEntry : ipEntry?.status;
   if (cookieStatus === "failed" || ipStatus === "failed") return "failed";
   if (cookieStatus === "passed" || ipStatus === "passed") return "passed";
   return "new";
 }
 
 function setRegistrationGate(res, req, status) {
-  registrationGateAttempts.set(requestIp(req), status);
-  addCookie(res, `acore_portal_register_gate=${status}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${status === "passed" ? 60 * 60 * 2 : 60 * 60 * 24 * 30}`);
+  pruneExpiringMap(registrationGateAttempts);
+  const maxAge = status === "passed" ? 60 * 60 * 2 : 60 * 60 * 24 * 30;
+  registrationGateAttempts.set(requestIp(req), { status, expiresAt: Date.now() + maxAge * 1000 });
+  addCookie(res, `acore_portal_register_gate=${status}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${cookieSecurity(req)}`);
 }
 
 function passwordHash(password, salt = crypto.randomBytes(16).toString("hex")) {
@@ -221,6 +252,7 @@ function requireLauncherHttps(req, res, next) {
 function launcherLoginRateLimit(req, username) {
   const key = `${requestIp(req)}:${username}`;
   const now = Date.now();
+  pruneExpiringMap(launcherLoginAttempts, now);
   const windowMs = 10 * 60 * 1000;
   const limit = 8;
   const current = launcherLoginAttempts.get(key) || { count: 0, resetAt: now + windowMs };
@@ -2013,14 +2045,26 @@ async function runRaidBagCleanup(body) {
   try {
     await connection.beginTransaction();
     const itemPlaceholders = itemGuids.map(() => "?").join(",");
-    await connection.query(`DELETE FROM acore_characters.character_inventory WHERE item IN (${itemPlaceholders})`, itemGuids);
-    await connection.query(`DELETE FROM acore_characters.item_instance WHERE guid IN (${itemPlaceholders})`, itemGuids);
+    await connection.query(`DELETE ci
+      FROM acore_characters.character_inventory ci
+      JOIN acore_characters.characters c ON c.guid = ci.guid
+      WHERE ci.item IN (${itemPlaceholders})
+        AND c.online = 0`, itemGuids);
+    await connection.query(`DELETE ii
+      FROM acore_characters.item_instance ii
+      LEFT JOIN acore_characters.character_inventory ci ON ci.item = ii.guid
+      WHERE ii.guid IN (${itemPlaceholders})
+        AND ci.item IS NULL`, itemGuids);
     for (const [guid, value] of valuesByCharacter.entries()) {
-      await connection.query("UPDATE acore_characters.characters SET money = money + ? WHERE guid = ?", [value, guid]);
+      await connection.query("UPDATE acore_characters.characters SET money = money + ? WHERE guid = ? AND online = 0", [value, guid]);
     }
     await connection.commit();
   } catch (error) {
-    await connection.rollback();
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error("Raid bag cleanup rollback failed:", rollbackError);
+    }
     throw error;
   } finally {
     connection.release();
@@ -2042,10 +2086,22 @@ function raidLockoutTarget(body) {
   return { raidKey, target, mode, scope, character, account };
 }
 
+function bindNumberList(prefix, values, params = {}) {
+  const cleanValues = [...new Set(values.map(Number).filter(Number.isFinite))];
+  if (!cleanValues.length) throw new Error(`${prefix} list cannot be empty.`);
+  const names = cleanValues.map((value, index) => {
+    const name = `${prefix}${index}`;
+    params[name] = value;
+    return `:${name}`;
+  });
+  return { sql: names.join(","), params, values: cleanValues };
+}
+
 function raidLockoutWhereClause({ target, scope, character, account }) {
   const maps = target.maps.map(Number).filter(Number.isFinite);
   if (!maps.length) throw new Error("Raid target has no maps.");
   const params = {};
+  const mapBinding = bindNumberList("map", maps, params);
   let scopeSql = "";
   if (scope === "character") {
     params.character = character;
@@ -2055,9 +2111,10 @@ function raidLockoutWhereClause({ target, scope, character, account }) {
     scopeSql = "AND UPPER(a.username) = :account";
   }
   return {
-    mapSql: maps.join(","),
+    mapSql: mapBinding.sql,
     scopeSql,
-    params
+    params,
+    maps: mapBinding.values
   };
 }
 
@@ -2178,26 +2235,25 @@ async function getRaidScopeAccountIds(targetInfo) {
 }
 
 async function getRaidRespawnRows(targetInfo, instanceIds = []) {
-  const { mapSql } = raidLockoutWhereClause(targetInfo);
+  const { mapSql, params } = raidLockoutWhereClause(targetInfo);
   const ids = [...new Set(instanceIds.map(Number).filter(Number.isFinite))];
   let instanceSql = "";
-  let values = [];
   if (targetInfo.scope !== "all") {
     if (!ids.length) return [];
-    instanceSql = `AND instanceId IN (${ids.map(() => "?").join(",")})`;
-    values = ids;
+    const instanceBinding = bindNumberList("respawnInstance", ids, params);
+    instanceSql = `AND instanceId IN (${instanceBinding.sql})`;
   }
 
   const creatureRows = await query(`SELECT 'creature' rowType, mapId map, instanceId instance, COUNT(*) rowCount
     FROM acore_characters.creature_respawn
     WHERE mapId IN (${mapSql})
       ${instanceSql}
-    GROUP BY mapId, instanceId`, values);
+    GROUP BY mapId, instanceId`, params);
   const gameobjectRows = await query(`SELECT 'gameobject' rowType, mapId map, instanceId instance, COUNT(*) rowCount
     FROM acore_characters.gameobject_respawn
     WHERE mapId IN (${mapSql})
       ${instanceSql}
-    GROUP BY mapId, instanceId`, values);
+    GROUP BY mapId, instanceId`, params);
   return [...creatureRows, ...gameobjectRows];
 }
 
@@ -2285,13 +2341,15 @@ async function runRaidLockoutReset(body) {
       );
     }
     if (accountIds.length) {
+      const accountParams = { ...params };
+      const accountBinding = bindNumberList("accountId", accountIds, accountParams);
       await connection.query(
         `DELETE ait
         FROM acore_characters.account_instance_times ait
         LEFT JOIN acore_characters.instance i ON i.id = ait.instanceId
-        WHERE ait.accountId IN (${accountIds.map(() => "?").join(",")})
+        WHERE ait.accountId IN (${accountBinding.sql})
           AND (i.map IN (${mapSql}) OR i.id IS NULL)`,
-        accountIds
+        accountParams
       );
     }
     if (targetInfo.scope === "all") {
@@ -2300,18 +2358,20 @@ async function runRaidLockoutReset(body) {
         LEFT JOIN acore_characters.instance i ON i.id = ait.instanceId
         WHERE i.id IS NULL`);
     } else if (accountIds.length) {
+      const accountParams = {};
+      const accountBinding = bindNumberList("orphanAccountId", accountIds, accountParams);
       await connection.query(
         `DELETE ait
         FROM acore_characters.account_instance_times ait
         LEFT JOIN acore_characters.instance i ON i.id = ait.instanceId
-        WHERE ait.accountId IN (${accountIds.map(() => "?").join(",")})
+        WHERE ait.accountId IN (${accountBinding.sql})
           AND i.id IS NULL`,
-        accountIds
+        accountParams
       );
     }
     if (targetInfo.scope === "all" || instanceIds.length) {
-      const respawnInstanceSql = targetInfo.scope === "all" ? "" : `AND instanceId IN (${instanceIds.map(() => "?").join(",")})`;
-      const respawnParams = targetInfo.scope === "all" ? [] : instanceIds;
+      const respawnParams = { ...params };
+      const respawnInstanceSql = targetInfo.scope === "all" ? "" : `AND instanceId IN (${bindNumberList("resetRespawnInstance", instanceIds, respawnParams).sql})`;
       const [creatureResult] = await connection.query(`DELETE FROM acore_characters.creature_respawn
         WHERE mapId IN (${mapSql})
           ${respawnInstanceSql}`, respawnParams);
@@ -2324,10 +2384,14 @@ async function runRaidLockoutReset(body) {
       FROM acore_characters.instance i
       LEFT JOIN acore_characters.character_instance ci ON ci.instance = i.id
       WHERE i.map IN (${mapSql})
-        AND ci.instance IS NULL`);
+        AND ci.instance IS NULL`, params);
     await connection.commit();
   } catch (error) {
-    await connection.rollback();
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error("Raid lockout reset rollback failed:", rollbackError);
+    }
     throw error;
   } finally {
     connection.release();
@@ -4512,19 +4576,29 @@ async function advisorGateway(mode, task) {
   const advisorToken = process.env.ADVISOR_TOKEN || "";
   if (!advisorUrl || !advisorToken) throw new Error("Advisor gateway is not configured.");
 
-  const response = await fetch(`${advisorUrl.replace(/\/+$/, "")}/${mode}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Advisor-Token": advisorToken
-    },
-    body: JSON.stringify({ task })
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || payload.stderr || `Advisor gateway returned ${response.status}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number(process.env.ADVISOR_TIMEOUT_MS || 5000));
+  try {
+    const response = await fetch(`${advisorUrl.replace(/\/+$/, "")}/${mode}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Advisor-Token": advisorToken
+      },
+      body: JSON.stringify({ task }),
+      signal: controller.signal
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || payload.stderr || `Advisor gateway returned ${response.status}`);
+    }
+    return payload;
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("Advisor gateway timed out.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  return payload;
 }
 
 function renderGearItem(slotInfo, item) {
@@ -5369,7 +5443,11 @@ async function saveRaidLootUpload(payload) {
     await connection.commit();
     return { runId, bossKills: payload.bossKills.length, acceptedDrops: payload.drops.length, storedDrops };
   } catch (error) {
-    await connection.rollback();
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error("Raid loot upload rollback failed:", rollbackError);
+    }
     throw error;
   } finally {
     connection.release();
@@ -5899,7 +5977,7 @@ app.post("/register", async (req, res) => {
       hash
     });
 
-    setSession(res, { id: accounts[0].id, username, isAdmin: false });
+    setSession(req, res, { id: accounts[0].id, username, isAdmin: false });
     res.redirect("/account?created=1");
   } catch (error) {
     res.status(400).send(layout({
@@ -5927,7 +6005,7 @@ app.post("/login", async (req, res) => {
     }
 
     await query("UPDATE acore_auth.portal_users SET last_login = CURRENT_TIMESTAMP WHERE account_id = :accountId", { accountId: rows[0].account_id });
-    setSession(res, { id: rows[0].account_id, username: rows[0].username, isAdmin: Boolean(rows[0].isAdmin) });
+    setSession(req, res, { id: rows[0].account_id, username: rows[0].username, isAdmin: Boolean(rows[0].isAdmin) });
     res.redirect("/account");
   } catch (error) {
     res.status(401).send(layout({
@@ -5938,8 +6016,8 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.post("/logout", (_req, res) => {
-  clearSession(res);
+app.post("/logout", (req, res) => {
+  clearSession(req, res);
   res.redirect("/");
 });
 

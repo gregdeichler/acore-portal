@@ -42,7 +42,7 @@ DB_USER=acore
 DB_PASSWORD=change-me
 SOAP_USER=SOAP_ADMIN
 SOAP_PASSWORD=change-me
-SESSION_SECRET=change-me-long-random-secret
+SESSION_SECRET=replace-with-at-least-32-random-characters
 ```
 
 Then run with Docker:
@@ -73,7 +73,7 @@ If those tables do not exist, loot views should degrade gracefully.
 - Do not commit `.env`.
 - Do not expose SOAP or MySQL directly to the public internet.
 - Use HTTPS before enabling remote account login.
-- Use a long random `SESSION_SECRET`.
+- `SESSION_SECRET` is required and must be at least 32 characters. Generate one with `openssl rand -hex 48`.
 - Create a least-privileged MySQL user for the portal if possible.
 - Keep admin actions behind portal admin accounts only.
 
