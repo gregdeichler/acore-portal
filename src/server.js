@@ -6728,3 +6728,25 @@ app.get("/api/launcher", async (_req, res) => {
 app.listen(port, () => {
   console.log(`AzerothCore portal listening on ${port}`);
 });
+
+function handleShutdown(signal) {
+  console.log(`Received ${signal}. Shutting down gracefully...`);
+  server.close(async () => {
+    try {
+      if (db) await db.end();
+      console.log("Database pool closed. Exiting process.");
+      process.exit(0);
+    } catch (err) {
+      console.error("Error during pool closure:", err);
+      process.exit(1);
+    }
+  });
+
+  setTimeout(() => {
+    console.error("Forcefully shutting down process (timeout).");
+    process.exit(1);
+  }, 10000);
+}
+
+process.on("SIGINT", () => handleShutdown("SIGINT"));
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
