@@ -6725,27 +6725,37 @@ app.get("/api/launcher", async (_req, res) => {
   }
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`AzerothCore portal listening on ${port}`);
 });
 
-function handleShutdown(signal) {
-  console.log(`Received ${signal}. Shutting down gracefully...`);
-  server.close(async () => {
-    try {
-      if (db) await db.end();
-      console.log("Database pool closed. Exiting process.");
-      process.exit(0);
-    } catch (err) {
-      console.error("Error during pool closure:", err);
-      process.exit(1);
-    }
-  });
+let shuttingDown = false;
 
-  setTimeout(() => {
+function handleShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Received ${signal}. Shutting down gracefully...`);
+
+  // Cover both HTTP draining and pool closure, including a stalled db.end().
+  const shutdownTimeout = setTimeout(() => {
     console.error("Forcefully shutting down process (timeout).");
     process.exit(1);
   }, 10000);
+
+  server.close(async (error) => {
+    let exitCode = error ? 1 : 0;
+    if (error) console.error("Error during HTTP server closure:", error);
+    try {
+      // Requests may still use the pool until the HTTP server has drained.
+      await db.end();
+      console.log("Database pool closed. Exiting process.");
+    } catch (err) {
+      console.error("Error during pool closure:", err);
+      exitCode = 1;
+    }
+    clearTimeout(shutdownTimeout);
+    process.exit(exitCode);
+  });
 }
 
 process.on("SIGINT", () => handleShutdown("SIGINT"));

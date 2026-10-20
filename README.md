@@ -94,3 +94,14 @@ The portal uses `.portaltools` SOAP commands when those admin actions are enable
 ## Public Assets
 
 The included art is generic replacement art. Server owners can replace files in `public/portal-art/` with their own realm-specific assets.
+
+## Shutdown regression tests
+
+Run `npm test` after installing dependencies. The tests start the real Express
+application in child processes and send SIGINT and SIGTERM. A test-only ESM
+loader substitutes a controllable MySQL pool, so no live database is required.
+They verify HTTP draining before pool cleanup, refusal of new connections,
+waiting for cleanup, repeated signals, cleanup failures, and the 10-second
+shutdown deadline during both HTTP draining and pool closure. Successful cleanup
+exits with status 0; cleanup errors or expiry of the deadline exit with status 1.
+`npm run check` remains the syntax check.
